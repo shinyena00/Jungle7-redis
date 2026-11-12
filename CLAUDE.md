@@ -37,6 +37,7 @@
 
 ### 5. 메모리 소유권
 
+
 - 새 메모리를 돌려주는 함수는 `copy_` / `create_`로 시작한다. 돌려받은 쪽이 free할 책임이 있다.
 - 해제는 짝 함수로 한다: `create_entry` ↔ `destroy_entry`
 - `const char *`는 빌려 쓰는 인자(free하지 않음), `const` 없는 `char *`는 넘겨받는 인자다.
