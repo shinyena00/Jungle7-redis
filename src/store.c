@@ -4,10 +4,10 @@
  * 공개 함수 모양은 include/store.h 그대로 둔다. 이 파일 안쪽만 자유.
  *
  *   store_set ──┬─ locate_bucket: fnv1a(key) % nbuckets → 칸
- *               ├─ find_key_in_chain(칸, key)  ← 만료된 노드도 찾는다
+ *               ├─ locate_link(칸, key)  ← 만료된 노드도 찾는다
  *               └─ 새 값 복사본 먼저 malloc → 바꿔치기 or 맨 앞에 새 노드
  *   store_get ──┐
- *   store_del ──┼─ locate_bucket → find_live_entry
+ *   store_del ──┼─ locate_live_link → link (노드를 가리키는 포인터의 주소)
  *   store_expire┘     (만료된 노드를 만나면 지우고 "없음")
  */
 #include "store.h"
@@ -45,9 +45,8 @@ static entry_t ** locate_bucket (store_t * store,
                                  const char * key, size_t klen);
 static uint64_t fnv1a (const char * data, size_t length);
 static char * copy_bytes (const char * source, size_t length);
-static entry_t * find_key_in_chain (entry_t * head,
-                                    const char * key, size_t klen,
-                                    entry_t ** previous);
+static entry_t ** locate_link (entry_t ** bucket,
+                               const char * key, size_t klen);
 static int entry_has_key (const entry_t * entry,
                           const char * key, size_t klen);
 static void replace_value (entry_t * entry,
@@ -55,14 +54,11 @@ static void replace_value (entry_t * entry,
 static entry_t * create_entry (const char * key, size_t klen,
                                char * val, size_t vlen, int64_t expire_at_ms);
 static void push_front_bucket (entry_t ** bucket, entry_t * entry);
-static entry_t * find_live_entry (entry_t ** bucket,
-                                  const char * key, size_t klen,
-                                  int64_t now_ms, entry_t ** previous);
+static entry_t ** locate_live_link (store_t * store,
+                                    const char * key, size_t klen,
+                                    int64_t now_ms);
 static int is_expired (const entry_t * entry, int64_t now_ms);
-static void remove_entry (entry_t ** bucket, entry_t * previous,
-                          entry_t * entry);
-static void unlink_entry (entry_t ** bucket, entry_t * previous,
-                          entry_t * entry);
+static void remove_entry (entry_t ** link);
 
 /* ── 공개 함수 ─────────────────────────────────────────────── */
 
@@ -88,17 +84,15 @@ void store_free (store_t * s) {
  */
 int store_set (store_t * s, const char * key, size_t klen,
                const char * val, size_t vlen, int64_t expire_at_ms) {
-    entry_t ** bucket = locate_bucket(s, key, klen);
-    //칸 자체를 돌려줘야 할 수도 있어서  entry_t ** 을 받음 ex. head 조작
-
     char * val_copy = copy_bytes(val, vlen);
     if (val_copy == NULL) {
         return -1;
     }
 
-    entry_t * existing = find_key_in_chain(*bucket, key, klen, NULL);
-    if (existing != NULL) {
-        replace_value(existing, val_copy, vlen, expire_at_ms);
+    entry_t ** bucket = locate_bucket(s, key, klen);
+    entry_t ** link = locate_link(bucket, key, klen);
+    if (link != NULL) {
+        replace_value(*link, val_copy, vlen, expire_at_ms);
         return 0;
     }
 
@@ -114,40 +108,36 @@ int store_set (store_t * s, const char * key, size_t klen,
 /* *val은 다음 store_* 호출 전까지만 유효하다 (store.h 약속). */
 int store_get (store_t * s, const char * key, size_t klen, int64_t now_ms,
                const char ** val, size_t * vlen) {
-    entry_t ** bucket = locate_bucket(s, key, klen);
-    entry_t * found = find_live_entry(bucket, key, klen, now_ms, NULL);
-    if (found == NULL) {
+    entry_t ** link = locate_live_link(s, key, klen, now_ms);
+    if (link == NULL) {
         return 0;
     }
 
-    *val = found->val;
-    *vlen = found->vlen;
+    *val = (*link)->val;
+    *vlen = (*link)->vlen;
     return 1;
 }
 
-/* 이미 만료된 키는 "없음"(0). 만료 노드는 find_live_entry가 치운다. (u18) */
+/* 이미 만료된 키는 "없음"(0). 만료 노드는 locate_live_link가 치운다. (u18) */
 int store_del (store_t * s, const char * key, size_t klen, int64_t now_ms) {
-    entry_t ** bucket = locate_bucket(s, key, klen);
-    entry_t * previous = NULL;
-    entry_t * found = find_live_entry(bucket, key, klen, now_ms, &previous);
-    if (found == NULL) {
+    entry_t ** link = locate_live_link(s, key, klen, now_ms);
+    if (link == NULL) {
         return 0;
     }
 
-    remove_entry(bucket, previous, found);
+    remove_entry(link);
     return 1;
 }
 
 /* 값은 그대로, 만료 시각만 바꾼다. 만료된 키를 되살리지 않는다. (u16, u18) */
 int store_expire (store_t * s, const char * key, size_t klen,
                   int64_t expire_at_ms, int64_t now_ms) {
-    entry_t ** bucket = locate_bucket(s, key, klen);
-    entry_t * found = find_live_entry(bucket, key, klen, now_ms, NULL);
-    if (found == NULL) {
+    entry_t ** link = locate_live_link(s, key, klen, now_ms);
+    if (link == NULL) {
         return 0;
     }
 
-    found->expire_at_ms = expire_at_ms;
+    (*link)->expire_at_ms = expire_at_ms;
     return 1;
 }
 
@@ -191,6 +181,7 @@ static void destroy_entry (entry_t * entry) {
     free(entry);
 }
 
+/* 칸 값이 아니라 칸의 주소를 돌려준다. 맨 앞 노드를 바꿔 끼울 수 있게. */
 static entry_t ** locate_bucket (store_t * store,
                                  const char * key, size_t klen) {
     return &store->buckets[fnv1a(key, klen) % store->nbuckets];
@@ -218,21 +209,19 @@ static char * copy_bytes (const char * source, size_t length) {
     return copy;
 }
 
-/* previous: NULL이 아니면 찾은 노드의 바로 앞 노드를 적는다 (맨 앞이면 NULL).
- *           못 찾았을 때 적힌 값은 쓰지 않는다. */
-static entry_t * find_key_in_chain (entry_t * head,
-                                    const char * key, size_t klen,
-                                    entry_t ** previous) {
-    entry_t * before = NULL;
-    entry_t * entry = head;
-    while (entry != NULL && !entry_has_key(entry, key, klen)) {
-        before = entry;
-        entry = entry->next;
+/*
+ * 키를 가진 노드를 "가리키고 있는 포인터"의 주소. 없으면 NULL.
+ * 맨 앞이면 칸 자신(bucket), 아니면 앞 노드의 &next가 된다.
+ * 그래서 맨 앞·가운데·끝을 나누지 않고 *link 하나로 빼낼 수 있다.
+ */
+static entry_t ** locate_link (entry_t ** bucket,
+                               const char * key, size_t klen) {
+    for (entry_t ** link = bucket; *link != NULL; link = &(*link)->next) {
+        if (entry_has_key(*link, key, klen)) {
+            return link;
+        }
     }
-    if (previous != NULL) {
-        *previous = before;
-    }
-    return entry;
+    return NULL;
 }
 
 /* 길이 먼저, 그다음 memcmp. strcmp는 '\0'이 든 키를 구분 못 한다. (u08) */
@@ -278,26 +267,21 @@ static void push_front_bucket (entry_t ** bucket, entry_t * entry) {
 
 /*
  * 게으른 만료: 찾은 노드가 만료됐으면 이 자리에서 지우고 NULL을 돌려준다.
- * 그래서 이름은 find_지만 체인을 바꿀 수 있다.
- * previous: NULL이 아니면 살아 있는 노드의 바로 앞 노드를 적는다 (삭제용).
+ * 그래서 이름은 locate_지만 체인을 바꿀 수 있다. (R2)
  */
-static entry_t * find_live_entry (entry_t ** bucket,
-                                  const char * key, size_t klen,
-                                  int64_t now_ms, entry_t ** previous) {
-    entry_t * before = NULL;
-    entry_t * found = find_key_in_chain(*bucket, key, klen, &before);
-    if (found == NULL) {
+static entry_t ** locate_live_link (store_t * store,
+                                    const char * key, size_t klen,
+                                    int64_t now_ms) {
+    entry_t ** bucket = locate_bucket(store, key, klen);
+    entry_t ** link = locate_link(bucket, key, klen);
+    if (link == NULL) {
         return NULL;
     }
-    if (is_expired(found, now_ms)) {
-        remove_entry(bucket, before, found);
+    if (is_expired(*link, now_ms)) {
+        remove_entry(link);
         return NULL;
     }
-
-    if (previous != NULL) {
-        *previous = before;
-    }
-    return found;
+    return link;
 }
 
 /* 정각(now == expire_at)엔 아직 보인다. 넘어야 만료. (R2, u12) */
@@ -306,18 +290,9 @@ static int is_expired (const entry_t * entry, int64_t now_ms) {
         && now_ms > entry->expire_at_ms;
 }
 
-static void remove_entry (entry_t ** bucket, entry_t * previous,
-                          entry_t * entry) {
-    unlink_entry(bucket, previous, entry);
+/* 앞쪽 포인터가 다음 노드를 가리키게 다시 이은 다음 해제한다. (u05~u07) */
+static void remove_entry (entry_t ** link) {
+    entry_t * entry = *link;
+    *link = entry->next;
     destroy_entry(entry);
-}
-
-/* previous: find_key_in_chain이 적어 준 바로 앞 노드 (맨 앞이면 NULL) */
-static void unlink_entry (entry_t ** bucket, entry_t * previous,
-                          entry_t * entry) {
-    if (previous == NULL) {
-        *bucket = entry->next;
-    } else {
-        previous->next = entry->next;
-    }
 }
