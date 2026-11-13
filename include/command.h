@@ -23,6 +23,8 @@ typedef struct {
     size_t length;
 } command_arg_t;
 
+/* REPLY_NIL: GET 캐시 미스. 앱이 원본에서 가져와 다시 SET한다.
+ * DEL·EXPIRE의 "없는 키입니다" 에러와는 따로 처리한다. */
 typedef enum {
     REPLY_OK,       /* +OK */
     REPLY_NIL,      /* $-1 */
