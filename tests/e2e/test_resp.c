@@ -1,5 +1,5 @@
 /*
- * test_resp.c — 조각 1 외부 테스트 (E1~E32, 노션 5-1)
+ * test_resp.c — 조각 1 외부 테스트 (E1~E36, 노션 5-1)
  *
  * 띄워 둔 미니 Redis 서버에 소켓으로 RESP를 보내고, 응답을 바이트 단위로 비교한다.
  * 키는 테스트마다 "t<pid>:<케이스>:" 접두어를 붙여서 테스트끼리 서로 안 섞이게 한다.
@@ -552,8 +552,10 @@ static void e28_client_disconnects_midway(void) {
 
 /* ---------- SET 옵션 · 검사 순서 · 상태 불변 ---------- */
 
-/* E29: SET 옵션 자리 → EX만 있으면 보관 기간 필요, 모르는 옵션·EX 두 번은 모르는 명령,
- *      원래 값 그대로 (R2, R4) */
+/* E29: SET 옵션 자리 → EX만 있으면 보관 기간 필요, 모르는 옵션은 모르는 명령,
+ *      원래 값 그대로 (R2, R4)
+ *      EX 두 번(단어 7개)은 개수 한도(5개)에 걸려 형식 에러 + 끊김 (11/13 결정).
+ *      끊긴 뒤라 원래 값 확인(GET)은 새 연결에서 한다. */
 static void e29_set_option_errors(void) {
     conn_t c; open_or_fail(&c);
     char k[128]; key(k, "e29", "k");
@@ -564,7 +566,11 @@ static void e29_set_option_errors(void) {
     SEND(&c, "SET", k, "new", "FOO", "10");
     EXPECT(&c, E_UNKNOWN);
     SEND(&c, "SET", k, "new", "EX", "10", "EX", "20");
-    EXPECT(&c, E_UNKNOWN);
+    EXPECT(&c, E_FORMAT);
+    CHECK(wait_closed(&c, 2000));
+    conn_close(&c);
+
+    open_or_fail(&c);
     SEND(&c, "GET", k);
     EXPECT_BULK(&c, "orig");
     conn_close(&c);
@@ -598,6 +604,59 @@ static void e32_error_keeps_state(void) {
     EXPECT(&c, E_BADVAL);
     SEND(&c, "GET", k);
     EXPECT_BULK(&c, "orig");
+    conn_close(&c);
+}
+
+/* ---------- 입력 한도 (11/13 결정, 노션 5-1) ----------
+ * ⚠️ AI 초안. 사람이 한 줄씩 검토할 것.
+ * 한도를 넘는 쪽은 E16처럼 길이 머리까지만 보낸다. 서버가 본문을 받기 전에
+ * 끊으므로, 본문까지 보내면 RST로 끊겨 에러 응답을 못 받을 수 있다. */
+
+/* 머리만 보내고 want 응답 + 끊김을 확인한다 */
+static void expect_rejected_head(const char *head, const char *want,
+                                 size_t wantlen) {
+    conn_t c; open_or_fail(&c);
+    CHECK(send_raw(&c, head, strlen(head)) == 0);
+    CHECK(expect_reply(&c, want, wantlen));
+    CHECK(wait_closed(&c, 2000));
+    conn_close(&c);
+}
+
+/* E33: 명령 이름 자리에 1MB 넘는 길이 → 너무 큽니다 + 끊김 (R1) */
+static void e33_huge_command_name(void) {
+    expect_rejected_head("*2\r\n$2000000\r\n",
+                         E_TOOBIG, sizeof(E_TOOBIG) - 1);
+}
+
+/* E34: 4번째·5번째 단어에 1MB 넘는 길이 → 너무 큽니다 + 끊김 (R1)
+ *      경계는 E16과 같다: 1,048,577B부터 초과 */
+static void e34_huge_option_words(void) {
+    expect_rejected_head("*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
+                         "$1048577\r\n",
+                         E_TOOBIG, sizeof(E_TOOBIG) - 1);
+    expect_rejected_head("*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
+                         "$2\r\nEX\r\n$1048577\r\n",
+                         E_TOOBIG, sizeof(E_TOOBIG) - 1);
+}
+
+/* E35: 모르는 명령이라도 두 번째 단어가 257B면 너무 큽니다 + 끊김
+ *      (검사 2 크기가 검사 3 명령보다 먼저) (R1, R4) */
+static void e35_unknown_command_long_key(void) {
+    expect_rejected_head("*2\r\n$5\r\nHELLO\r\n$257\r\n",
+                         E_TOOBIG, sizeof(E_TOOBIG) - 1);
+}
+
+/* E36: 단어 6개(*6) → 잘못된 요청 형식입니다 + 끊김. *N만 보고 바로 거른다.
+ *      5개(SET k v EX n)는 정상 (R4) */
+static void e36_too_many_words(void) {
+    expect_rejected_head("*6\r\n", E_FORMAT, sizeof(E_FORMAT) - 1);
+
+    conn_t c; open_or_fail(&c);
+    char k[128]; key(k, "e36", "k");
+    SEND(&c, "SET", k, "v", "EX", "10");
+    EXPECT(&c, RE_OK);
+    SEND(&c, "GET", k);
+    EXPECT_BULK(&c, "v");
     conn_close(&c);
 }
 
@@ -645,5 +704,9 @@ int main(void) {
     RUN(e30_error_order);
     RUN(e31_huge_length_rejected_before_body);
     RUN(e32_error_keeps_state);
+    RUN(e33_huge_command_name);
+    RUN(e34_huge_option_words);
+    RUN(e35_unknown_command_long_key);
+    RUN(e36_too_many_words);
     return FINISH();
 }

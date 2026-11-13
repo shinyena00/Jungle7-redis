@@ -9,6 +9,7 @@
  *   store_get ──┐
  *   store_del ──┼─ locate_live_link → link (노드를 가리키는 포인터의 주소)
  *   store_expire┘     (만료된 노드를 만나면 지우고 "없음")
+ *   store_purge_expired ── 칸마다 remove_expired_in_chain (메모리 부족 때만)
  */
 #include "store.h"
 
@@ -59,6 +60,7 @@ static entry_t ** locate_live_link (store_t * store,
                                     int64_t now_ms);
 static int is_expired (const entry_t * entry, int64_t now_ms);
 static void remove_entry (entry_t ** link);
+static size_t remove_expired_in_chain (entry_t ** bucket, int64_t now_ms);
 
 /* ── 공개 함수 ─────────────────────────────────────────────── */
 
@@ -139,6 +141,15 @@ int store_expire (store_t * s, const char * key, size_t klen,
 
     (*link)->expire_at_ms = expire_at_ms;
     return 1;
+}
+
+/* 지운 게 없으면 0. 호출자가 "다시 해 봐야 소용없다"를 알 수 있게. */
+int store_purge_expired (store_t * s, int64_t now_ms) {
+    size_t removed = 0;
+    for (size_t i = 0; i < s->nbuckets; i++) {
+        removed += remove_expired_in_chain(&s->buckets[i], now_ms);
+    }
+    return removed > 0;
 }
 
 /* ── 도우미 함수 (처음 불리는 순서) ────────────────────────── */
@@ -295,4 +306,19 @@ static void remove_entry (entry_t ** link) {
     entry_t * entry = *link;
     *link = entry->next;
     destroy_entry(entry);
+}
+
+/* 지운 자리에는 다음 노드가 당겨 오므로, 지웠을 때는 link를 옮기지 않는다. */
+static size_t remove_expired_in_chain (entry_t ** bucket, int64_t now_ms) {
+    size_t removed = 0;
+    entry_t ** link = bucket;
+    while (*link != NULL) {
+        if (is_expired(*link, now_ms)) {
+            remove_entry(link);
+            removed++;
+        } else {
+            link = &(*link)->next;
+        }
+    }
+    return removed;
 }

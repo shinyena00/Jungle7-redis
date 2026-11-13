@@ -11,7 +11,7 @@ include/store.h          단위 테스트가 부르는 해시 테이블 인터�
 tests/check.h            CHECK / RUN / FINISH 매크로 (의존성 없음)
 tests/unit/test_store.c  U1~U18. store를 직접 호출, 시각은 테스트가 넘김
 tests/e2e/resp_client.*  소켓으로 RESP를 주고받는 도우미 (지도만 알면 되는 코드)
-tests/e2e/test_resp.c    E1~E32. 띄워 둔 서버에 붙어서 응답을 바이트 단위로 비교
+tests/e2e/test_resp.c    E1~E36. 띄워 둔 서버에 붙어서 응답을 바이트 단위로 비교
 tests/Makefile
 ```
 
