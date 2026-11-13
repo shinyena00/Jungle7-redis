@@ -51,4 +51,10 @@ int store_del(store_t *s, const char *key, size_t klen, int64_t now_ms);
 int store_expire(store_t *s, const char *key, size_t klen,
                  int64_t expire_at_ms, int64_t now_ms);
 
+/* 만료된 키를 전부 지운다. 게으른 만료라 아무도 안 건드린 만료 키가
+ * 메모리를 잡고 있을 수 있어서, store_set이 메모리 부족일 때 부른다.
+ * 전체를 훑으므로 느리다. 평소에는 부르지 않는다. (11/13 추가, 팀 확인 필요)
+ * 반환: 1 = 하나 이상 지움, 0 = 지운 것 없음 */
+int store_purge_expired(store_t *s, int64_t now_ms);
+
 #endif
