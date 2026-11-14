@@ -22,7 +22,8 @@
 
 typedef struct store store_t;
 
-/* 칸 nbuckets개로 시작하는 빈 저장소. 조각 1은 8칸 고정, 늘리지 않음. (R1)
+/* 칸 nbuckets개로 시작하는 빈 저장소. 키 수가 칸 수에 닿으면 두 배로 늘린다
+ * (점진적 rehash, 조각 2). 줄이지는 않음. (R1, R6)
  * 반환: 실패하면 NULL */
 store_t *store_new(size_t nbuckets);
 void store_free(store_t *s);
