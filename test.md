@@ -161,3 +161,75 @@ gcc -std=c11 -Wall -Wextra -g -O0 -D_GNU_SOURCE -Iinclude \
 | 외부 테스트 E1~E36 | 미실행 (server.c 없음) |
 
 다음 할 일: server.c(epoll) → WSL에서 `make e2e` (E1~E36) → 테스트 사람 검토
+
+---
+
+# 조각 1 테스트 기록 — server.c 1·2단계
+
+- 날짜: 2026-11-14
+- 브랜치: `yena`
+- 대상: `src/server.c` (epoll level-triggered, 스레드 하나), 루트 `Makefile`
+- 환경: WSL2 Ubuntu (커널 6.6), `cc -std=c11 -Wall -Wextra -g -O0 -D_GNU_SOURCE`
+
+## 1. 이번에 넣은 것
+
+| 단계 | 내용 |
+|---|---|
+| 1 | `MINI_REDIS_BIND`(기본 127.0.0.1)·`MINI_REDIS_PORT`(기본 6380) 읽기, SIGPIPE 무시, 받는 소켓, epoll 루프, accept, 연결 정리 |
+| 2 | recv 한 번 → `resp_parse` → `command_execute` → `resp_write_reply` → send, 못 다 보낸 것만 `EPOLLOUT`으로 이어 보내기 |
+| 2 | 형식 에러·너무 큼: 에러를 붙이고 읽기를 멈춘 뒤(`EPOLLOUT`만 감시) 다 보내면 닫기 |
+
+아직 없는 것: 한 바퀴 100개(3단계), 4MB 한도·버퍼 메모리 부족 시 purge(4단계, 지금은 바로 닫음), 유휴 타임아웃(5단계), EMFILE 처리(6단계).
+
+## 2. 빌드
+
+```bash
+make server        # 레포 루트. ./mini-redis
+```
+
+경고 0.
+
+## 3. 1단계 확인
+
+| 확인 | 결과 |
+|---|---|
+| 잘못된 포트 `abc` `0` `70000` `80x` `""` `" 80"` `+80` 20자리 | 이유 출력 후 exit 1 |
+| 잘못된 주소 `localhost` `1.2.3` `""` | exit 1 |
+| 같은 포트로 하나 더 | `bind 실패: Address already in use`, exit 1 |
+| 접속 10개 → 전부 끊기, 50번 붙었다 끊기, 5MB 보내기 | 열린 fd 수가 처음과 같음, 서버 살아 있음 |
+| CPU (접속 유지 중·조용할 때) | 0~0.5% |
+
+## 4. 외부 테스트 (처음으로 실제 서버)
+
+```bash
+./mini-redis &
+cd tests && make e2e
+```
+
+**결과: 36 tests, 0 failed** (E1~E36). AddressSanitizer 빌드(`-fsanitize=address,undefined`)로 다시 돌려도 36/36, ASan 경고 0.
+
+> WSL에 valgrind가 없어서 ASan으로 대신했다. 서버를 시그널로 끄기 때문에 종료 시 누수 검사는 안 됨.
+
+## 5. 추가 확인 (임시 스크립트, 레포에 안 넣음, ASan 빌드)
+
+| 확인 | 결과 |
+|---|---|
+| 1MB 값(`\0`·`\r\n` 포함) SET → GET | 같은 바이트 |
+| `SET` + `GET` + 깨진 RESP를 한 번에 | `+OK`, `$1 v`, `-ERR 잘못된 요청 형식입니다` 받은 뒤 끊김 |
+| 1MB GET 20개 + 깨진 RESP, 2초 동안 안 읽음 | 그동안 CPU 거의 0, 연결 유지 (닫는 중) |
+| 이어서 다 읽기 | 20MB + 에러 전부 도착 후 끊김 |
+| 1MB GET 30개 보내고 안 읽고 RST로 끊기 × 5 (E37 미리 보기) | 서버 살아 있음 |
+| 그 뒤 새 연결 | 정상 |
+| 열린 fd 수 | 처음과 같음 |
+
+**결과: 11 checks, 0 failed**
+
+## 6. 정리
+
+| 확인 | 결과 |
+|---|---|
+| 경고 | 0 |
+| 외부 테스트 E1~E36 | 36/36 (일반·ASan) |
+| 추가 확인 | 11/11 |
+
+다음 할 일: 3단계(한 바퀴 100개 + 결정 다) → 4단계(4MB 한도, purge) → 5단계(유휴 타임아웃) → 6단계(EMFILE)
