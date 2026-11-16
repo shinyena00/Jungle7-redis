@@ -6,15 +6,16 @@
  *   store_set ──┬─ step_rehash: 옛 테이블 칸 하나를 새 테이블로 (R6)
  *               ├─ locate_link_in_store(key) ← 두 테이블 다 보고, 만료 노드도 찾음
  *               ├─ 있으면 바꿔치기
- *               └─ 없으면 새 노드 → start_rehash_if_full → 넣는 테이블 맨 앞
+ *               └─ 없으면 새 노드 → start_rehash_if_full → current 맨 앞
  *   store_get ──┐
  *   store_del ──┼─ step_rehash → locate_live_link (만료 노드를 만나면 지우고 "없음")
  *   store_expire┘
  *   store_purge_expired ── 두 테이블의 칸마다 remove_expired_in_chain
  *
- * rehash 중에는 테이블이 두 개다. tables[0] = 옛 테이블, tables[1] = 새 테이블.
- * 새 키는 tables[1]에만 넣고, 옛 테이블은 rehash_index 칸부터 차례로 비운다.
- * 다 비면 tables[1]이 tables[0]이 된다.
+ * rehash 중에는 테이블이 두 개다. previous = 옛 테이블, current = 새 테이블.
+ * rehash를 시작하면 지금 테이블을 previous로 내리고 2배 테이블을 current에 둔다.
+ * 새 키는 언제나 current에 넣고, previous는 rehash_index 칸부터 차례로 비운다.
+ * 다 비면 previous를 해제해 테이블이 current 하나로 돌아온다.
  */
 #include "store.h"
 
@@ -32,15 +33,16 @@ typedef struct entry {
     struct entry * next;
 } entry_t;
 
-/* buckets가 NULL이면 비어 있는 자리 (rehash 중이 아닐 때 tables[1]) */
+/* buckets가 NULL이면 비어 있는 자리 (rehash 중이 아닐 때 previous) */
 typedef struct table {
     entry_t ** buckets;
     size_t nbuckets;
 } table_t;
 
 struct store {
-    table_t tables[2];
-    size_t rehash_index;    /* 옛 테이블에서 다음에 옮길 칸. rehash 중에만 의미 */
+    table_t current;        /* 새 키를 넣는 테이블 */
+    table_t previous;       /* rehash 중에만 있는 옛 테이블 */
+    size_t rehash_index;    /* previous에서 다음에 옮길 칸. rehash 중에만 의미 */
     size_t count;           /* 두 테이블을 합친 노드 수 (만료됐지만 안 지운 것 포함) */
 };
 
@@ -186,8 +188,8 @@ int store_expire (store_t * s, const char * key, size_t klen,
  * 방금 GET한 값의 주소가 그대로 남는다 (server.c 🔒 조건 2).
  */
 int store_purge_expired (store_t * s, int64_t now_ms) {
-    size_t removed = remove_expired_in_table(s, &s->tables[0], now_ms)
-                   + remove_expired_in_table(s, &s->tables[1], now_ms);
+    size_t removed = remove_expired_in_table(s, &s->previous, now_ms)
+                   + remove_expired_in_table(s, &s->current, now_ms);
     return removed > 0;
 }
 
@@ -203,7 +205,8 @@ static store_t * create_store (size_t nbuckets) {
         return NULL;
     }
     *store = (store_t){
-        .tables = {{ .buckets = buckets, .nbuckets = nbuckets }},
+        .current = { .buckets = buckets, .nbuckets = nbuckets },
+        .previous = { .buckets = NULL, .nbuckets = 0 },
         .rehash_index = 0,
         .count = 0,
     };
@@ -211,8 +214,8 @@ static store_t * create_store (size_t nbuckets) {
 }
 
 static void destroy_store (store_t * store) {
-    destroy_table(&store->tables[0]);
-    destroy_table(&store->tables[1]);
+    destroy_table(&store->current);
+    destroy_table(&store->previous);
     free(store);
 }
 
@@ -265,24 +268,24 @@ static void step_rehash (store_t * store) {
         move_chain(store, bucket);
         store->rehash_index++;
     }
-    if (store->rehash_index == store->tables[0].nbuckets) {
+    if (store->rehash_index == store->previous.nbuckets) {
         finish_rehash(store);
     }
 }
 
 static int is_rehashing (const store_t * store) {
-    return store->tables[1].buckets != NULL;
+    return store->previous.buckets != NULL;
 }
 
 /* 빈 칸은 건너뛰며 rehash_index를 옮긴다. 끝에 닿거나 빈 칸만
  * MAX_EMPTY_VISITS개 보면 NULL (이번 요청은 여기까지). */
 static entry_t ** locate_next_chain (store_t * store) {
-    table_t * old = &store->tables[0];
+    table_t * previous = &store->previous;
     for (int visited = 0; visited < MAX_EMPTY_VISITS; visited++) {
-        if (store->rehash_index == old->nbuckets) {
+        if (store->rehash_index == previous->nbuckets) {
             return NULL;
         }
-        entry_t ** bucket = &old->buckets[store->rehash_index];
+        entry_t ** bucket = &previous->buckets[store->rehash_index];
         if (*bucket != NULL) {
             return bucket;
         }
@@ -297,7 +300,7 @@ static void move_chain (store_t * store, entry_t ** bucket) {
     while (*bucket != NULL) {
         entry_t * entry = *bucket;
         *bucket = entry->next;
-        push_front_bucket(locate_bucket(&store->tables[1],
+        push_front_bucket(locate_bucket(&store->current,
                                         entry->key, entry->klen),
                           entry);
     }
@@ -324,26 +327,28 @@ static void push_front_bucket (entry_t ** bucket, entry_t * entry) {
     *bucket = entry;
 }
 
-/* 옛 테이블은 이 시점에 모든 칸이 비어 있어서 칸 배열만 해제하면 된다. */
+/* previous는 이 시점에 모든 칸이 비어 있어서 칸 배열만 해제하면 된다. */
 static void finish_rehash (store_t * store) {
-    free(store->tables[0].buckets);
-    store->tables[0] = store->tables[1];
-    store->tables[1] = (table_t){ .buckets = NULL, .nbuckets = 0 };
+    free(store->previous.buckets);
+    store->previous = (table_t){ .buckets = NULL, .nbuckets = 0 };
     store->rehash_index = 0;
 }
 
 /*
- * rehash 중이면 옛 테이블에 없을 때 새 테이블도 본다.
- * 한 키는 두 테이블 중 한 곳에만 있다 (새 키는 새 테이블에만 넣으므로).
+ * rehash 중이면 옛 테이블(previous)부터 보고, 없으면 current를 본다.
+ * 한 키는 두 테이블 중 한 곳에만 있다 (새 키는 current에만 넣으므로).
+ * rehash 중이 아니면 previous는 칸이 0개라 보면 안 된다 (% 0).
  */
 static entry_t ** locate_link_in_store (store_t * store,
                                         const char * key, size_t klen) {
-    entry_t ** link = locate_link(locate_bucket(&store->tables[0], key, klen),
-                                  key, klen);
-    if (link != NULL || !is_rehashing(store)) {
-        return link;
+    if (is_rehashing(store)) {
+        entry_t ** link = locate_link(
+            locate_bucket(&store->previous, key, klen), key, klen);
+        if (link != NULL) {
+            return link;
+        }
     }
-    return locate_link(locate_bucket(&store->tables[1], key, klen), key, klen);
+    return locate_link(locate_bucket(&store->current, key, klen), key, klen);
 }
 
 /*
@@ -401,26 +406,28 @@ static entry_t * create_entry (const char * key, size_t klen,
  * 적재율(노드 수 / 칸 수)이 1이면 칸 수를 두 배로 늘린 새 테이블을 만든다.
  * 칸 배열을 못 만들면 늘리지 않고 넘어간다: 체인이 길어질 뿐 저장은 되고,
  * 다음 새 키 때 다시 시도한다. 그래서 SET이 이 일로 실패하지 않는다.
+ * 칸 수가 SIZE_MAX / 2를 넘으면 2배가 넘쳐 작은 수(최악은 0)가 되므로 늘리지 않는다.
  */
 static void start_rehash_if_full (store_t * store) {
-    if (is_rehashing(store) || store->count < store->tables[0].nbuckets) {
+    size_t nbuckets = store->current.nbuckets;
+    if (is_rehashing(store) || store->count < nbuckets
+        || nbuckets > SIZE_MAX / 2) {
         return;
     }
-    size_t nbuckets = store->tables[0].nbuckets * 2;
-    entry_t ** buckets = calloc(nbuckets, sizeof(*buckets));
+    entry_t ** buckets = calloc(nbuckets * 2, sizeof(*buckets));
     if (buckets == NULL) {
         return;
     }
-    store->tables[1] = (table_t){ .buckets = buckets, .nbuckets = nbuckets };
+    store->previous = store->current;
+    store->current = (table_t){ .buckets = buckets, .nbuckets = nbuckets * 2 };
     store->rehash_index = 0;
 }
 
-/* rehash 중이면 새 테이블에 넣는다. 옛 테이블에 넣으면 이미 지나간 칸에
+/* 언제나 current에 넣는다. rehash 중에 previous에 넣으면 이미 지나간 칸에
  * 들어가 영영 안 옮겨질 수 있다. */
 static void insert_entry (store_t * store, entry_t * entry) {
-    table_t * table = is_rehashing(store) ? &store->tables[1]
-                                          : &store->tables[0];
-    push_front_bucket(locate_bucket(table, entry->key, entry->klen), entry);
+    push_front_bucket(locate_bucket(&store->current, entry->key, entry->klen),
+                      entry);
     store->count++;
 }
 
